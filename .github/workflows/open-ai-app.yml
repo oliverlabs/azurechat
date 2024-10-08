@@ -68,7 +68,7 @@ jobs:
           node-version: "20.x"
 
       - name: ⬇️ Download artifact from build job
-        uses: actions/download-artifact@v4.0.4
+        uses: actions/download-artifact@v4.1.8
         with:
           name: Nextjs-site
 
