@@ -1,0 +1,147 @@
+name: Deploy to Web App (main)
+
+# When this action will be executed
+on:
+  # Automatically trigger it when detected changes in repo
+  push:
+    branches: [main]
+
+  # Automatically trigger it when a pull request is opened, re-opened, or when the head branch of the pull request is updated.
+  # In this case this workflow will deploy the changes to a deployment slot in Azure App Service
+  pull_request:
+
+  # Allow manual workflow trigger - deploys to production deployment slot in Azure App Service
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🌱 Checkout to the branch
+        uses: actions/checkout@v4
+
+      - name: 🍏 Set up Node.js version
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: ⚙️ npm install and build
+        run: |
+          cd ./src
+          npm install
+          npm run build --if-present
+          cd ..
+
+      - name: 📂 Copy standalone into the root
+        run: cp -R ./src/.next/standalone ./site-deploy
+
+      - name: 📂 Copy static into the .next folder
+        run: cp -R ./src/.next/static ./site-deploy/.next/static
+
+      - name: 📂 Copy Public folder
+        run: cp -R ./src/public ./site-deploy/public
+
+      - name: 📦 Package Next application
+        run: |
+          cd ./site-deploy
+          zip Nextjs-site.zip ./* .next -qr
+
+      - name: 🔍 Diagnostics
+        run: |
+          ls ./src
+          ls ./src/.next
+          ls ./site-deploy
+
+      - name: ⬆️ Publish Next Application artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nextjs-site
+          path: ./site-deploy/Nextjs-site.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: Production
+    env:
+      AZURE_APP_SERVICE_NAME: ${{ secrets.AZURE_APP_SERVICE_NAME }}
+      SLOT_NAME: pr-${{ github.event.number }}
+
+    steps:
+      - name: 🍏 Set up Node.js version
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: ⬇️ Download artifact from build job
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: Nextjs-site
+
+      - name: 🗝️ Azure Login
+        uses: azure/login@v2.2.0
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Set the build during deployment setting to false. This setting was added in the templates to all azd to work, but breaks deployment via webapps-deploy
+      - name: Update App Service settings
+        uses: azure/CLI@v2.1.0
+        with:
+          inlineScript: |
+            rg=$(az webapp list --query "[?name=='$AZURE_APP_SERVICE_NAME'].resourceGroup" --output tsv)
+            echo Setting SCM_DO_BUILD_DURING_DEPLOYMENT=false on app service $AZURE_APP_SERVICE_NAME
+            az webapp config appsettings set -n $AZURE_APP_SERVICE_NAME -g $rg --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false -o none
+            echo Setting --startup-file=\"node server.js\" on app service $AZURE_APP_SERVICE_NAME
+            az webapp config set --startup-file="node server.js" -n $AZURE_APP_SERVICE_NAME -g $rg -o none
+            sleep 10
+      
+      # If this is a PR create a deployment slot
+      - if: github.event_name =='pull_request'
+        name: PR - create deployment slot
+        uses: azure/CLI@v2.1.0
+        with:
+          inlineScript: |
+            rg=$(az webapp list --query "[?name=='$AZURE_APP_SERVICE_NAME'].resourceGroup" --output tsv)
+            echo Creating deployment slot $SLOT_NAME on app service $AZURE_APP_SERVICE_NAME
+            az webapp deployment slot create --name $AZURE_APP_SERVICE_NAME --resource-group $rg --slot $SLOT_NAME --configuration-source $AZURE_APP_SERVICE_NAME 
+            echo Updating NEXTAUTH_URL environment variable in slot $SLOT_NAME
+            az webapp config appsettings set -n $AZURE_APP_SERVICE_NAME -g $rg --settings NEXTAUTH_URL=$AZURE_APP_SERVICE_NAME-$SLOT_NAME -s $SLOT_NAME -o none
+            clientId=$(az webapp config appsettings list --name $AZURE_APP_SERVICE_NAME --resource-group $rg --query "[?name=='AZURE_AD_CLIENT_ID'].value" --output tsv)
+            if [ -z "$clientId" ]; then
+              echo "AAD auth is not configured - app registration will not be updated"
+              exit 0
+            else
+              echo "AAD auth is configured - update app registration"
+              objectid=$(az ad app show --id $clientid --query id --output tsv | tr -d '[:space:]')
+              redirecturl="https://${AZURE_APP_SERVICE_NAME}-${SLOT_NAME}.azurewebsites.net/api/auth/callback/azure-ad"
+              graphurl="https://graph.microsoft.com/v1.0/applications/${objectid}"
+              echo "Adding redirect url $redirecturl to application id $clientId"
+              az rest --method PATCH --uri $graphurl --body "{'web':{'redirectUris':['${redirecturl}']}}"
+            fi
+
+      # Deploy to main slot
+      - if: github.event_name != 'pull_request'
+        name: 🚀 Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3.0.1
+        with:
+          app-name: ${{ secrets.AZURE_APP_SERVICE_NAME }}
+          package: ${{ github.workspace }}/Nextjs-site.zip
+
+      # Deploy to PR deployment slot
+      - if: github.event_name == 'pull_request'
+        name: 🚀 Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3.0.1
+        with:
+          app-name: ${{ secrets.AZURE_APP_SERVICE_NAME }}
+          package: ${{ github.workspace }}/Nextjs-site.zip
+          slot-name: ${{ env.SLOT_NAME }}
+
+      - name: 🧹 Cleanup
+        run: rm ${{ github.workspace }}/Nextjs-site.zip
+
+      # If this is a PR create a deployment slot
+      - if: github.event_name =='pull_request'
+        run: echo "Deployment to slot $SLOT_NAME complete - navigate to https://$AZURE_APP_SERVICE_NAME-$SLOT_NAME.azurewebsites.net to test the PR"

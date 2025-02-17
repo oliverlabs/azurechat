@@ -1,0 +1,33 @@
+
+# https://github.com/Azure-Samples/github-actions-deployment-slots
+
+name: Delete PR slot when PR is closed
+
+on:
+  pull_request:
+    types: [closed]
+
+concurrency: 
+  group: ci-${{ github.event.number }}
+  cancel-in-progress: true
+
+env:
+  WEBAPP_NAME: ${{ secrets.AZURE_APP_SERVICE_NAME }}
+  SLOT_NAME: pr-${{ github.event.number }}
+
+jobs:
+  delete-slot:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Log into Azure CLI with service principal
+      uses: azure/login@v1.1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Update App Service settings
+      uses: azure/CLI@v2.1.0
+      with:
+        inlineScript: |
+          rg=$(az webapp list --query "[?name=='$AZURE_APP_SERVICE_NAME'].resourceGroup" --output tsv)
+          az webapp deployment slot delete --resource-group $RESOURCE_GROUP  --name $rg --slot $SLOT_NAME
